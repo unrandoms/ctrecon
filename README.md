@@ -46,7 +46,7 @@ go install github.com/az7rb/crt.sh/v3@v3.0.1
 ```bash
 git clone https://github.com/az7rb/crt.sh
 cd crt.sh
-go build -ldflags "-X main.version=3.0.0" -o crt.sh .
+go build -ldflags "-X main.version=3.0.1" -o crt.sh .
 ```
 
 </details>

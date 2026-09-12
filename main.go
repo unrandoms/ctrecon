@@ -45,6 +45,7 @@ const (
 	formatText outputFormat = iota
 	formatJSON
 	formatBurp
+	formatEnriched
 )
 
 // ── Result structures ─────────────────────────────────────────────────────────
@@ -616,7 +617,7 @@ func printBanner() {
 	if quietMode {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "\n"+cCyan+cBold+
+	fmt.Fprint(os.Stderr, "\n"+cCyan+cBold+
 		"             __         __  \n"+
 		"  __________/ /_  _____/ /_ \n"+
 		" / ___/ ___/ __/ / ___/ __ \\\n"+
@@ -844,6 +845,8 @@ func autoFilename(domains []string, fmt outputFormat) string {
 		return base + "_ct.json"
 	case formatBurp:
 		return base + "_burp_scope.json"
+	case formatEnriched:
+		return base + "_enriched.json"
 	default:
 		return base + "_subs.txt"
 	}
@@ -857,11 +860,15 @@ func main() {
 	orgFlag     := flag.String("O", "", "Organization name (use + for spaces, e.g. -O \"Google LLC\")")
 	outputFlag  := flag.String("o", "", "Output file (auto-named if -f is set without -o)")
 	appendFlag  := flag.Bool("a", false, "Append to output file")
-	formatFlag  := flag.String("f", "txt", "Output format: txt | json | burp")
+	formatFlag  := flag.String("f", "txt", "Output format: txt | json | burp | enriched")
 	timeoutFlag := flag.Int("t", 30, "HTTP timeout per source in seconds")
 	skipFlag    := flag.String("s", "", "Skip sources: comma-separated (e.g. crt.sh,crt.name)")
 	flag.BoolVar(&quietMode, "q", false, "Quiet: only print results, no UI (useful for piping)")
-	updateFlag  := flag.Bool("update", false, "Update crt.sh to the latest version")
+	updateFlag    := flag.Bool("update", false, "Update crt.sh to the latest version")
+	recursiveFlag := flag.Bool("r", false, "Recursively enumerate subdomains of discovered subdomains")
+	depthFlag     := flag.Int("depth", 1, "Maximum recursion depth for -r (1–3, default 1)")
+	resolveFlag   := flag.Bool("resolve", false, "Resolve IPs and enrich via Shodan InternetDB and RIPE Stat")
+	deltaFlag     := flag.Bool("delta", false, "Delta mode: persist results to ~/.ctrecon/DOMAIN.db; print only new subdomains")
 
 	flag.Usage = func() {
 		printBanner()
@@ -875,9 +882,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  -o  <file>     Output file (default: auto-named when -f is used)\n")
 		fmt.Fprintf(os.Stderr, "  -a             Append to output file instead of overwrite\n")
 		fmt.Fprintf(os.Stderr, "  -f  <format>   Output format:\n")
-		fmt.Fprintf(os.Stderr, "                   txt   Plain text, one subdomain per line (default)\n")
-		fmt.Fprintf(os.Stderr, "                   json  Structured JSON with source stats and timestamps\n")
-		fmt.Fprintf(os.Stderr, "                   burp  Burp Suite advanced scope JSON\n")
+		fmt.Fprintf(os.Stderr, "                   txt      Plain text, one subdomain per line (default)\n")
+		fmt.Fprintf(os.Stderr, "                   json     Structured JSON with source stats and timestamps\n")
+		fmt.Fprintf(os.Stderr, "                   burp     Burp Suite advanced scope JSON\n")
+		fmt.Fprintf(os.Stderr, "                   enriched JSON array with domain/ips/asn/cidr/ports/cves\n")
+		fmt.Fprintf(os.Stderr, "  -r             Recursively enumerate discovered subdomains\n")
+		fmt.Fprintf(os.Stderr, "  -depth <n>     Recursion depth for -r, max 3 (default 1)\n")
+		fmt.Fprintf(os.Stderr, "  -resolve       Resolve IPs; enrich via Shodan InternetDB and RIPE Stat\n")
+		fmt.Fprintf(os.Stderr, "  -delta         Delta mode: print only new subdomains; track in ~/.ctrecon/\n")
 		fmt.Fprintf(os.Stderr, "  -s  <sources>  Skip sources: crt.sh, certspotter, crt.name, shodan-ctl\n")
 		fmt.Fprintf(os.Stderr, "  -t  <sec>      HTTP timeout per source (default: 30)\n")
 		fmt.Fprintf(os.Stderr, "  -q             Quiet mode: only print found subdomains\n")
@@ -895,17 +907,23 @@ func main() {
 	// Check for updates in background (non-blocking)
 	go checkUpdate()
 
-	// Parse output format
+	// Parse output format; -resolve without an explicit format implies enriched
 	var outFmt outputFormat
 	switch strings.ToLower(*formatFlag) {
 	case "txt", "text", "":
-		outFmt = formatText
+		if *resolveFlag {
+			outFmt = formatEnriched
+		} else {
+			outFmt = formatText
+		}
 	case "json":
 		outFmt = formatJSON
 	case "burp":
 		outFmt = formatBurp
+	case "enriched":
+		outFmt = formatEnriched
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown format %q — use: txt, json, burp\n", *formatFlag)
+		fmt.Fprintf(os.Stderr, "Unknown format %q — use: txt, json, burp, enriched\n", *formatFlag)
 		os.Exit(1)
 	}
 
@@ -989,7 +1007,7 @@ func main() {
 
 	// Determine output destination
 	outPath := *outputFlag
-	if outPath == "" && (outFmt == formatJSON || outFmt == formatBurp) {
+	if outPath == "" && (outFmt == formatJSON || outFmt == formatBurp || outFmt == formatEnriched) {
 		outPath = autoFilename(domains, outFmt)
 	}
 
@@ -1015,8 +1033,21 @@ func main() {
 	if outPath != "" && !quietMode {
 		logInfo("Output → %s%s%s", cBold, outPath, cReset)
 	}
+	if *recursiveFlag && !quietMode {
+		depth := *depthFlag
+		if depth > 3 {
+			depth = 3
+		}
+		if depth < 1 {
+			depth = 1
+		}
+		logInfo("Recursive mode enabled (depth %d)", depth)
+	}
+	if *deltaFlag && !quietMode {
+		logInfo("Delta mode enabled — tracking new subdomains in %s~/.ctrecon/%s", cBold, cReset)
+	}
 
-	// Run
+	// Run enumeration
 	var results []HuntResult
 	totalStart := time.Now()
 
@@ -1026,18 +1057,48 @@ func main() {
 		}
 		logInfo("Scanning %s%s%s", cBold, domain, cReset)
 
-		// In quiet mode: stream subdomains immediately (pipe-friendly)
-		// In normal mode: collect and print as clean block after status lines
-		var onFresh func([]string)
-		if outFmt == formatText && quietMode {
-			onFresh = func(fresh []string) {
-				for _, sub := range fresh {
-					fmt.Println(sub)
+		var r HuntResult
+		if *recursiveFlag {
+			depth := *depthFlag
+			if depth < 1 {
+				depth = 1
+			}
+			if depth > 3 {
+				depth = 3
+			}
+			subResults := huntRecursive(domain, skipSources, depth)
+			r = mergeResults(domain, subResults)
+		} else {
+			// In quiet text mode: stream subdomains immediately (pipe-friendly).
+			// Delta mode needs the full result set first, so skip streaming there.
+			var onFresh func([]string)
+			if outFmt == formatText && quietMode && !*deltaFlag {
+				onFresh = func(fresh []string) {
+					for _, sub := range fresh {
+						fmt.Println(sub)
+					}
+				}
+			}
+			r = huntDomain(domain, skipSources, onFresh)
+		}
+
+		// Delta mode: persist to SQLite and keep only newly seen subdomains
+		if *deltaFlag {
+			db, err := openDeltaDB(domain)
+			if err != nil {
+				logWarn("Delta DB error: %v", err)
+			} else {
+				newSubs, err := applyDelta(db, domain, r)
+				db.Close()
+				if err != nil {
+					logWarn("Delta apply error: %v", err)
+				} else {
+					r.Subdomains = newSubs
+					r.Total = len(newSubs)
 				}
 			}
 		}
 
-		r := huntDomain(domain, skipSources, onFresh)
 		results = append(results, r)
 
 		if outFmt == formatText {
@@ -1062,21 +1123,37 @@ func main() {
 			cDim, time.Since(totalStart).Seconds(), cReset)
 	}
 
-	// For non-text formats: write all results at once
+	// Write structured / enriched output at once
 	if outFmt != formatText {
 		var w io.Writer = os.Stdout
 		if outFile != nil {
 			w = outFile
 		}
-		var err error
+		var writeErr error
 		switch outFmt {
 		case formatJSON:
-			err = writeJSON(w, results)
+			writeErr = writeJSON(w, results)
 		case formatBurp:
-			err = writeBurp(w, results)
+			writeErr = writeBurp(w, results)
+		case formatEnriched:
+			var allSubs []string
+			deduped := make(map[string]struct{})
+			for _, r := range results {
+				for _, sub := range r.Subdomains {
+					if _, ok := deduped[sub]; !ok {
+						deduped[sub] = struct{}{}
+						allSubs = append(allSubs, sub)
+					}
+				}
+			}
+			if !quietMode {
+				logInfo("Resolving and enriching %s%d%s subdomains...", cBold, len(allSubs), cReset)
+			}
+			enriched := enrichSubdomains(allSubs)
+			writeErr = writeEnriched(w, enriched)
 		}
-		if err != nil {
-			logWarn("Error writing output: %v", err)
+		if writeErr != nil {
+			logWarn("Error writing output: %v", writeErr)
 			os.Exit(1)
 		}
 	}
